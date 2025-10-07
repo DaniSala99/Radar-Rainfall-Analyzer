@@ -1,14 +1,12 @@
-# Analisi_file_radar_integrato_multiprocessing_con_logging_e_Peq0.py
+# Analisi_file_radar_integrato_multiprocessing_con_logging_e_Peq0_FIX_CRS.py
 """
-Analizzatore Radar per Analisi Pluviometriche - Versione Completa
+Analizzatore Radar per Analisi Pluviometriche - Versione con FIX CRS
 ================================================================================
-Include:
-- Verifica integrità archivio completa
-- Logging dettagliato con classifiche
-- Supporto formato file con secondi
-- Elaborazione parallela ottimizzata
-- Gestione file mancanti e corrotti
-- Calcolo Peq_0 (Pioggia Equivalente)
+NOVITÀ:
+- Rilevamento automatico CRS dai file radar
+- Riproiezione automatica shapefile su CRS radar
+- Logging dettagliato compatibilità CRS
+- Gestione robusta sistemi di riferimento diversi
 """
 
 import os
@@ -43,14 +41,15 @@ RADAR_DATA_PATH = r"M:\Doc_so\01_centro_funzionale\01_13_Radar DEWTRA\MCM_1\merg
 # Parametro fisico per Peq_0
 LAMBDA_PEQ = 0.2
 
+# Cache globale per CRS radar (condivisa tra processi)
+RADAR_CRS_CACHE = None
+
+
 # -------------------------------------------------------------------------
 # CONFIGURAZIONE PROCESSI
 # -------------------------------------------------------------------------
 def get_optimal_process_count():
-    """
-    Calcola il numero ottimale di processi: (core_totali // 2) - 1
-    Con minimo di 1 processo
-    """
+    """Calcola il numero ottimale di processi: (core_totali // 2) - 1"""
     total_cores = psutil.cpu_count(logical=True)
     optimal_processes = max(1, (total_cores // 2) - 1)
     
@@ -63,20 +62,133 @@ NUM_PROCESSES = get_optimal_process_count()
 
 
 # -------------------------------------------------------------------------
+# FUNZIONI PER GESTIONE CRS
+# -------------------------------------------------------------------------
+def rileva_crs_radar(radar_file_path):
+    """
+    Rileva il CRS da un file radar TIF.
+    
+    Args:
+        radar_file_path: Path al file radar
+        
+    Returns:
+        rasterio.CRS o None
+    """
+    try:
+        with rasterio.open(radar_file_path) as src:
+            crs = src.crs
+            if crs is not None:
+                return crs
+            else:
+                print(f"ATTENZIONE: File {os.path.basename(radar_file_path)} senza CRS definito")
+                return None
+    except Exception as e:
+        print(f"ERRORE nel rilevare CRS da {radar_file_path}: {e}")
+        return None
+
+
+def rileva_crs_radar_da_archivio(data_inizio, max_tentativi=10):
+    """
+    Rileva il CRS dai file radar nell'archivio.
+    Prova con i primi file disponibili.
+    
+    Args:
+        data_inizio: Data da cui iniziare la ricerca
+        max_tentativi: Numero massimo di file da provare
+        
+    Returns:
+        rasterio.CRS o None
+    """
+    print("\n=== RILEVAMENTO CRS ARCHIVIO RADAR ===")
+    
+    data_corrente = data_inizio
+    tentativi = 0
+    
+    while tentativi < max_tentativi:
+        path_giorno = os.path.join(
+            RADAR_DATA_PATH,
+            data_corrente.strftime('%Y'),
+            data_corrente.strftime('%m'),
+            data_corrente.strftime('%d')
+        )
+        
+        if os.path.exists(path_giorno):
+            # Cerca il primo file .tif
+            for nome_file in sorted(os.listdir(path_giorno)):
+                if nome_file.endswith('.tif'):
+                    file_path = os.path.join(path_giorno, nome_file)
+                    crs = rileva_crs_radar(file_path)
+                    
+                    if crs is not None:
+                        print(f"CRS rilevato da: {file_path}")
+                        print(f"CRS: {crs}")
+                        print(f"EPSG: {crs.to_epsg() if crs.to_epsg() else 'Non standard'}")
+                        return crs
+                    
+                    tentativi += 1
+                    if tentativi >= max_tentativi:
+                        break
+        
+        data_corrente += timedelta(days=1)
+    
+    print("ERRORE: Impossibile rilevare CRS dai file radar")
+    return None
+
+
+def verifica_e_riproietta_shapefile(shapefile_path, target_crs, temp_dir):
+    """
+    Verifica il CRS dello shapefile e lo riproietta se necessario.
+    
+    Args:
+        shapefile_path: Path allo shapefile originale
+        target_crs: CRS target (dai raster radar)
+        temp_dir: Directory temporanea per shapefile riproiettato
+        
+    Returns:
+        (shapefile_path_finale, necessaria_riproiezione, crs_originale)
+    """
+    try:
+        gdf = gpd.read_file(shapefile_path)
+        crs_originale = gdf.crs
+        
+        print(f"\n  Shapefile: {os.path.basename(shapefile_path)}")
+        print(f"  CRS shapefile: {crs_originale}")
+        print(f"  CRS target (radar): {target_crs}")
+        
+        # Verifica se i CRS sono compatibili
+        if crs_originale is None:
+            print(f"  ATTENZIONE: Shapefile senza CRS definito!")
+            return shapefile_path, False, None
+        
+        # Confronta i CRS
+        if crs_originale == target_crs:
+            print(f"  ✓ CRS compatibili, nessuna riproiezione necessaria")
+            return shapefile_path, False, crs_originale
+        
+        # Riproiezione necessaria
+        print(f"  → Riproiezione necessaria da {crs_originale} a {target_crs}")
+        
+        gdf_reproj = gdf.to_crs(target_crs)
+        
+        # Salva shapefile riproiettato
+        zona_nome = os.path.splitext(os.path.basename(shapefile_path))[0]
+        reproj_path = os.path.join(temp_dir, f"{zona_nome}_reproj.shp")
+        gdf_reproj.to_file(reproj_path)
+        
+        print(f"  ✓ Shapefile riproiettato salvato: {reproj_path}")
+        
+        return reproj_path, True, crs_originale
+        
+    except Exception as e:
+        print(f"  ERRORE nella verifica/riproiezione: {e}")
+        return shapefile_path, False, None
+
+
+# -------------------------------------------------------------------------
 # FUNZIONI PER CALCOLO PEQ_0
 # -------------------------------------------------------------------------
 def calcola_peq0(P5, CN, lam=LAMBDA_PEQ):
-    """
-    Calcola Peq₀ (mm) – modello NRCS-CN generalizzato.
-    
-    Args:
-        P5: Pioggia cumulata 5 giorni precedenti (mm)
-        CN: Curve Number medio della zona
-        lam: Parametro lambda (default 0.2)
-    
-    Returns:
-        Peq₀ in mm
-    """
+    """Calcola Peq₀ (mm) – modello NRCS-CN generalizzato."""
     S = 25400 / CN - 254
     sqrt_term = S * (P5 + ((1 - lam) / 2) ** 2 * S)
     M = np.maximum(np.sqrt(sqrt_term) - ((1 + lam) / 2) * S, 0)
@@ -84,15 +196,7 @@ def calcola_peq0(P5, CN, lam=LAMBDA_PEQ):
 
 
 def calcola_cn_per_zone(raster_folder):
-    """
-    Calcola il CN medio per ogni zona dai file raster ASC.
-    
-    Args:
-        raster_folder: Path alla directory contenente i raster CN
-    
-    Returns:
-        Dizionario {'IM_01': 78.4, 'IM_02': 82.1, ...}
-    """
+    """Calcola il CN medio per ogni zona dai file raster ASC."""
     zone_cn = {}
     raster_path = Path(raster_folder)
     
@@ -101,13 +205,11 @@ def calcola_cn_per_zone(raster_folder):
         return zone_cn
     
     for asc_file in sorted(raster_path.glob("*.ASC")):
-        # Estrai numero zona dal nome file
         num_match = re.search(r"(\d{1,2})$", asc_file.stem)
         if not num_match:
             print(f"  Raster {asc_file.name}: numero zona non riconosciuto, salto.")
             continue
         
-        # Crea chiave zona (es: IM_01)
         zona_key = f"IM_{int(num_match.group()):02d}"
         
         try:
@@ -124,43 +226,24 @@ def calcola_cn_per_zone(raster_folder):
 
 
 def calcola_cum_5d(df_24h):
-    """
-    Calcola la pioggia cumulata dei 5 giorni precedenti per ogni data.
-    
-    Args:
-        df_24h: DataFrame con colonne ['Data', 'IM_01', 'IM_02', ...]
-    
-    Returns:
-        DataFrame con stessa struttura ma con cumulate 5 giorni
-    """
+    """Calcola la pioggia cumulata dei 5 giorni precedenti per ogni data."""
     cum_5d = df_24h.copy()
     zone_columns = [col for col in df_24h.columns if col != 'Data']
     
     for col in zone_columns:
-        # Per ogni riga, somma i 5 giorni precedenti (escluso il giorno corrente)
         cum_5d[col] = df_24h[col].rolling(window=6, min_periods=1).sum().shift(1).fillna(0)
     
     return cum_5d
 
 
 def calcola_peq0_per_tutte_zone(cum_5d, zone_cn):
-    """
-    Calcola Peq₀ per tutte le zone e tutte le date.
-    
-    Args:
-        cum_5d: DataFrame con cumulate 5 giorni
-        zone_cn: Dizionario con CN per zona
-    
-    Returns:
-        DataFrame con Peq₀ calcolato
-    """
+    """Calcola Peq₀ per tutte le zone e tutte le date."""
     peq0_df = cum_5d.copy()
     zone_columns = [col for col in cum_5d.columns if col != 'Data']
     
     for col in zone_columns:
         if col in zone_cn:
             cn_value = zone_cn[col]
-            # Applica calcola_peq0 a tutta la colonna
             peq0_df[col] = cum_5d[col].apply(
                 lambda p5: calcola_peq0(p5, cn_value) if pd.notna(p5) and p5 > 0 else 0
             )
@@ -172,17 +255,7 @@ def calcola_peq0_per_tutte_zone(cum_5d, zone_cn):
 
 
 def somma_statistiche_con_peq0(df_statistica, df_peq0):
-    """
-    Somma una statistica (6h, 12h, 24h) con Peq₀.
-    
-    Args:
-        df_statistica: DataFrame con statistica originale
-        df_peq0: DataFrame con Peq₀
-    
-    Returns:
-        DataFrame con somma statistica + Peq₀
-    """
-    # Merge sulle date
+    """Somma una statistica (6h, 12h, 24h) con Peq₀."""
     merged = df_statistica.merge(df_peq0, on='Data', how='left', suffixes=('', '_peq0'))
     
     zone_columns = [col for col in df_statistica.columns if col != 'Data']
@@ -191,7 +264,6 @@ def somma_statistiche_con_peq0(df_statistica, df_peq0):
     for col in zone_columns:
         col_peq0 = f"{col}_peq0"
         if col_peq0 in merged.columns:
-            # Somma i valori, riempiendo NaN con 0
             result[col] = merged[col].fillna(0) + merged[col_peq0].fillna(0)
         else:
             result[col] = merged[col].fillna(0)
@@ -206,13 +278,12 @@ class FileIntegrityReport:
     """Gestisce il report di integrità dei file radar"""
     
     def __init__(self):
-        self.file_corrotti = []  # Lista di (data, ora, percorso, errore)
-        self.file_mancanti = []  # Lista di (data, ora_attesa)
-        self.file_validi = []    # Lista di (data, ora, percorso)
+        self.file_corrotti = []
+        self.file_mancanti = []
+        self.file_validi = []
         self.giorni_analizzati = set()
     
     def aggiungi_file_corrotto(self, data, ora, percorso, errore):
-        """Registra un file corrotto"""
         self.file_corrotti.append({
             'data': data.strftime('%Y-%m-%d'),
             'ora': ora.strftime('%H:%M'),
@@ -222,7 +293,6 @@ class FileIntegrityReport:
         })
     
     def aggiungi_file_mancante(self, data, ora_attesa):
-        """Registra un file mancante"""
         self.file_mancanti.append({
             'data': data.strftime('%Y-%m-%d'),
             'ora': ora_attesa.strftime('%H:%M'),
@@ -230,7 +300,6 @@ class FileIntegrityReport:
         })
     
     def aggiungi_file_valido(self, data, ora, percorso):
-        """Registra un file valido"""
         self.file_validi.append({
             'data': data.strftime('%Y-%m-%d'),
             'ora': ora.strftime('%H:%M'),
@@ -239,7 +308,6 @@ class FileIntegrityReport:
         })
     
     def get_summary(self):
-        """Restituisce un riepilogo statistico"""
         return {
             'totale_corrotti': len(self.file_corrotti),
             'totale_mancanti': len(self.file_mancanti),
@@ -256,19 +324,15 @@ class LogManager:
         self.log_directory.mkdir(parents=True, exist_ok=True)
         self.log_file = self.log_directory / f"analisi_radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         
-        # Setup del logger principale
         self.logger = logging.getLogger('RadarAnalyzer')
         self.logger.setLevel(logging.INFO)
         
-        # File handler
         fh = logging.FileHandler(self.log_file, mode='w', encoding='utf-8')
         fh.setLevel(logging.INFO)
         
-        # Console handler
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
         
-        # Formatter
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         fh.setFormatter(formatter)
         ch.setFormatter(formatter)
@@ -277,19 +341,15 @@ class LogManager:
         self.logger.addHandler(ch)
     
     def log_info(self, message):
-        """Log messaggio informativo"""
         self.logger.info(message)
     
     def log_error(self, message):
-        """Log messaggio di errore"""
         self.logger.error(message)
     
     def log_warning(self, message):
-        """Log messaggio di warning"""
         self.logger.warning(message)
     
     def log_integrity_report(self, report):
-        """Log del report di integrità dei file"""
         summary = report.get_summary()
         
         self.log_info("=" * 100)
@@ -302,13 +362,11 @@ class LogManager:
         self.log_info(f"File mancanti: {summary['totale_mancanti']}")
         self.log_info("")
         
-        # Dettaglio file corrotti
         if report.file_corrotti:
             self.log_error("-" * 100)
             self.log_error(f"FILE CORROTTI O DANNEGGIATI ({len(report.file_corrotti)} totali)")
             self.log_error("-" * 100)
             
-            # Raggruppa per data
             corrotti_per_data = defaultdict(list)
             for file_info in report.file_corrotti:
                 corrotti_per_data[file_info['data']].append(file_info)
@@ -324,13 +382,11 @@ class LogManager:
             self.log_info("✓ Nessun file corrotto rilevato")
             self.log_info("")
         
-        # Dettaglio file mancanti
         if report.file_mancanti:
             self.log_warning("-" * 100)
             self.log_warning(f"FILE MANCANTI ({len(report.file_mancanti)} totali)")
             self.log_warning("-" * 100)
             
-            # Raggruppa per data
             mancanti_per_data = defaultdict(list)
             for file_info in report.file_mancanti:
                 mancanti_per_data[file_info['data']].append(file_info)
@@ -348,10 +404,7 @@ class LogManager:
         self.log_info("")
     
     def log_finestre_analizzate(self, zona_nome, data, durata, finestre_dati):
-        """
-        Log dettagliato delle finestre analizzate
-        finestre_dati: lista di tuple (timestamp_inizio, timestamp_fine, statistiche_dict, file_list)
-        """
+        """Log dettagliato delle finestre analizzate"""
         self.logger.info("=" * 80)
         self.logger.info(f"ZONA: {zona_nome} | DATA: {data} | DURATA: {durata}h")
         self.logger.info("-" * 80)
@@ -361,7 +414,6 @@ class LogManager:
             self.logger.info("=" * 80)
             return
         
-        # Ordina per media decrescente
         finestre_ordinate = sorted(finestre_dati, key=lambda x: x[2].get('media', 0), reverse=True)
         
         self.logger.info(f"Totale finestre analizzate: {len(finestre_ordinate)}")
@@ -379,7 +431,6 @@ class LogManager:
             self.logger.info(f"  {idx:3d}. Finestra: {inizio.strftime('%Y-%m-%d %H:%M')} → {fine.strftime('%Y-%m-%d %H:%M')}")
             self.logger.info(f"       Media: {media:.2f} mm")
             
-            # Log altre statistiche se presenti
             altre_stats = []
             if 'max' in stats:
                 altre_stats.append(f"Max: {stats['max']:.2f}")
@@ -393,13 +444,11 @@ class LogManager:
             if altre_stats:
                 self.logger.info(f"       {' | '.join(altre_stats)}")
             
-            # Log dei file utilizzati
             if file_list:
                 self.logger.info(f"       File utilizzati ({len(file_list)}): {', '.join(file_list)}")
             
             self.logger.info("")
         
-        # Finestra massima
         max_finestra = finestre_ordinate[0]
         self.logger.info(f">>> FINESTRA CON MEDIA MASSIMA: {max_finestra[0].strftime('%Y-%m-%d %H:%M')} → {max_finestra[1].strftime('%Y-%m-%d %H:%M')}")
         self.logger.info(f">>> VALORE MEDIA MASSIMA: {max_finestra[2].get('media', 0):.2f} mm")
@@ -418,7 +467,6 @@ def load_config(config_path):
     config['data_inizio'] = pd.to_datetime(config['data_inizio'])
     config['data_fine'] = pd.to_datetime(config['data_fine'])
     
-    # Valori di default per Peq_0
     if 'Peq_0' not in config.get('statistiche', {}):
         config['statistiche']['Peq_0'] = False
     
@@ -429,13 +477,11 @@ def load_config(config_path):
 
 
 def estrai_timestamp(nome_file):
-    """Estrae timestamp dal nome file - Supporta formato con secondi (yyyyMMddHHmmss)"""
-    # Prima prova con formato completo (con secondi)
+    """Estrae timestamp dal nome file - Supporta formato con secondi"""
     match = re.search(r"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})", os.path.basename(nome_file))
     if match:
         return datetime(*map(int, match.groups()))
     
-    # Fallback al formato senza secondi (per compatibilità)
     match = re.search(r"(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})", os.path.basename(nome_file))
     if match:
         return datetime(*map(int, match.groups()))
@@ -444,13 +490,7 @@ def estrai_timestamp(nome_file):
 
 
 def verifica_integrita_archivio(data_inizio, data_fine):
-    """
-    Verifica l'integrità dell'archivio radar per il periodo specificato
-    Controlla file mancanti e file corrotti
-    
-    Returns:
-        FileIntegrityReport: Report completo dell'analisi
-    """
+    """Verifica l'integrità dell'archivio radar per il periodo specificato"""
     report = FileIntegrityReport()
     date_range = pd.date_range(data_inizio, data_fine)
     
@@ -462,7 +502,6 @@ def verifica_integrita_archivio(data_inizio, data_fine):
     for data_corrente in date_range:
         report.giorni_analizzati.add(data_corrente.date())
         
-        # Costruisci il percorso della directory del giorno
         path_giorno = os.path.join(
             RADAR_DATA_PATH,
             data_corrente.strftime('%Y'),
@@ -470,25 +509,20 @@ def verifica_integrita_archivio(data_inizio, data_fine):
             data_corrente.strftime('%d')
         )
         
-        # Verifica se la directory esiste
         if not os.path.exists(path_giorno):
-            # Se la directory non esiste, tutti i file del giorno sono mancanti
             for ora in range(24):
                 timestamp_atteso = data_corrente.replace(hour=ora, minute=0, second=0, microsecond=0)
                 report.aggiungi_file_mancante(data_corrente, timestamp_atteso)
             continue
         
-        # Scansiona tutti i file .tif nella directory
-        file_trovati = {}  # dizionario {timestamp: percorso_file}
+        file_trovati = {}
         
         for nome_file in os.listdir(path_giorno):
             if nome_file.endswith('.tif'):
                 file_path = os.path.join(path_giorno, nome_file)
                 timestamp = estrai_timestamp(file_path)
                 
-                # Solo file con minuti=00 e secondi=00 (terminano con 0000.tif)
                 if timestamp and timestamp.minute == 0 and timestamp.second == 0:
-                    # Verifica integrità del file
                     try:
                         with rasterio.open(file_path) as src:
                             if src.count == 0:
@@ -499,7 +533,6 @@ def verifica_integrita_archivio(data_inizio, data_fine):
                                     "File senza bande raster"
                                 )
                             else:
-                                # Prova a leggere i dati
                                 _ = src.read(1)
                                 report.aggiungi_file_valido(data_corrente, timestamp, file_path)
                                 file_trovati[timestamp] = file_path
@@ -511,13 +544,11 @@ def verifica_integrita_archivio(data_inizio, data_fine):
                             str(e)
                         )
         
-        # Verifica file mancanti (ore esatte da 00 a 23)
         for ora in range(24):
             timestamp_atteso = data_corrente.replace(hour=ora, minute=0, second=0, microsecond=0)
             if timestamp_atteso not in file_trovati:
                 report.aggiungi_file_mancante(data_corrente, timestamp_atteso)
         
-        # Progress ogni 10 giorni
         if len(report.giorni_analizzati) % 10 == 0:
             print(f"Verificati {len(report.giorni_analizzati)} giorni...")
     
@@ -532,10 +563,7 @@ def verifica_integrita_archivio(data_inizio, data_fine):
 
 
 def ottieni_lista_file_giorno(data_corrente, integrity_report=None):
-    """
-    Restituisce la lista ordinata dei raster con minuti = 00
-    Ora utilizza il report di integrità se disponibile
-    """
+    """Restituisce la lista ordinata dei raster con minuti = 00"""
     path = os.path.join(
         RADAR_DATA_PATH,
         data_corrente.strftime('%Y'),
@@ -548,14 +576,12 @@ def ottieni_lista_file_giorno(data_corrente, integrity_report=None):
     
     files = []
     
-    # Se abbiamo il report di integrità, usiamo quello
     if integrity_report:
         data_str = data_corrente.strftime('%Y-%m-%d')
         for file_info in integrity_report.file_validi:
             if file_info['data'] == data_str:
                 files.append(file_info['percorso'])
     else:
-        # Fallback al metodo originale
         for f in os.listdir(path):
             if f.endswith('.tif'):
                 timestamp = estrai_timestamp(f)
@@ -574,18 +600,15 @@ def ottieni_lista_file_giorno(data_corrente, integrity_report=None):
     return files_sorted
 
 
-def somma_file_tif_finestra(lista_file_con_timestamp, finestra_inizio, finestra_fine, temp_dir):
+def somma_file_tif_finestra(lista_file_con_timestamp, finestra_inizio, finestra_fine, temp_dir, radar_crs=None):
     """
-    Somma i file TIF che cadono nella finestra temporale specificata
-    LOGICA: Include file dall'ora di inizio fino all'ora precedente la fine
-    Esempio: finestra 09:00-15:00 include file ore 09,10,11,12,13,14 (NON 15)
+    Somma i file TIF che cadono nella finestra temporale specificata.
+    NOVITÀ: Accetta radar_crs per impostare il CRS corretto sui file sommati.
     """
     file_finestra = []
     timestamp_inclusi = []
     
     for file_path, timestamp in lista_file_con_timestamp:
-        # Il file rappresenta la registrazione che INIZIA a timestamp
-        # e dura 1 ora, quindi copre [timestamp, timestamp+1h)
         if finestra_inizio <= timestamp < finestra_fine:
             file_finestra.append(file_path)
             timestamp_inclusi.append(timestamp)
@@ -593,10 +616,8 @@ def somma_file_tif_finestra(lista_file_con_timestamp, finestra_inizio, finestra_
     if not file_finestra:
         return None, None, []
     
-    # Lista dei file inclusi (solo nomi) per logging
     file_inclusi = [os.path.basename(f) for f in file_finestra]
     
-    # Debug info
     print(f"    Sommando {len(file_finestra)} file per finestra {finestra_inizio.strftime('%Y-%m-%d %H:%M')}-{finestra_fine.strftime('%Y-%m-%d %H:%M')}")
     print(f"    Ore incluse: {', '.join([t.strftime('%H:%M') for t in sorted(timestamp_inclusi)])}")
     
@@ -605,7 +626,12 @@ def somma_file_tif_finestra(lista_file_con_timestamp, finestra_inizio, finestra_
         meta = src.meta.copy()
         meta.update(dtype=np.float64)
         
-        if src.crs is None:
+        # NOVITÀ: Usa il CRS rilevato dall'archivio invece di assumere WGS84
+        if src.crs is None and radar_crs is not None:
+            print(f"    File senza CRS, applico CRS archivio: {radar_crs}")
+            meta.update(crs=radar_crs)
+        elif src.crs is None:
+            print(f"    ATTENZIONE: File senza CRS e CRS archivio non disponibile")
             meta.update(crs=rasterio.CRS.from_epsg(4326))
     
     for file_path in file_finestra[1:]:
@@ -634,6 +660,13 @@ def ritaglia_raster_sommato_con_shapefile(raster_sommato_path, shapefile_path, t
         shapes = [mapping(geom) for geom in shapefile.geometry]
         
         with rasterio.open(raster_sommato_path) as src:
+            # Verifica compatibilità CRS
+            if shapefile.crs != src.crs:
+                print(f"      ATTENZIONE: CRS mismatch rilevato durante ritaglio!")
+                print(f"      Raster CRS: {src.crs}")
+                print(f"      Shapefile CRS: {shapefile.crs}")
+                # In teoria non dovrebbe succedere se abbiamo riproiettato prima
+            
             out_image, out_transform = rasterio.mask.mask(
                 src, shapes, crop=True, nodata=-9999, all_touched=True
             )
@@ -656,6 +689,8 @@ def ritaglia_raster_sommato_con_shapefile(raster_sommato_path, shapefile_path, t
         
     except Exception as e:
         print(f"      ERRORE durante il ritaglio: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None
 
 
@@ -702,10 +737,11 @@ def calcola_statistiche_su_array_ritagliato(array_ritagliato, statistiche_config
         return None
 
 
-def finestre_mobili_con_somma_e_ritaglio(file_con_timestamp, durata_ore, data_corrente, shapefile_path, statistiche_config, temp_dir):
+def finestre_mobili_con_somma_e_ritaglio(file_con_timestamp, durata_ore, data_corrente, shapefile_path, 
+                                         statistiche_config, temp_dir, radar_crs=None):
     """
     Implementa la logica delle finestre mobili con approccio "somma prima, ritaglia dopo"
-    Restituisce: (statistiche_massime, lista_tutte_finestre_per_logging)
+    NOVITÀ: Accetta radar_crs per gestire correttamente i sistemi di riferimento
     """
     if not file_con_timestamp:
         print("    Nessun file con timestamp valido per finestra mobile.")
@@ -737,7 +773,7 @@ def finestre_mobili_con_somma_e_ritaglio(file_con_timestamp, durata_ore, data_co
         fine_giorno = inizio_giorno + timedelta(days=1)
         
         raster_sommato_path, finestra_info, file_inclusi = somma_file_tif_finestra(
-            file_data_corrente, inizio_giorno, fine_giorno, temp_dir
+            file_data_corrente, inizio_giorno, fine_giorno, temp_dir, radar_crs
         )
         
         if raster_sommato_path is None:
@@ -774,10 +810,6 @@ def finestre_mobili_con_somma_e_ritaglio(file_con_timestamp, durata_ore, data_co
     
     min_time = min(timestamps)
     max_time = max(timestamps)
-    
-    # CORREZIONE CRITICA: Aggiungi 1 ora al max_time per includere l'ultima finestra
-    # Esempio: se l'ultimo file è alle 23:00, rappresenta 23:00-24:00
-    # quindi max_time_effettivo è 24:00 (00:00 del giorno dopo)
     max_time_effettivo = max_time + timedelta(hours=1)
     
     print(f"    Range temporale disponibile: {min_time.strftime('%Y-%m-%d %H:%M')} - {max_time_effettivo.strftime('%Y-%m-%d %H:%M')}")
@@ -788,7 +820,6 @@ def finestre_mobili_con_somma_e_ritaglio(file_con_timestamp, durata_ore, data_co
     step = timedelta(minutes=60)
     corrente = min_time
     
-    # Conta finestre attese
     finestre_attese = 0
     temp_corrente = min_time
     while temp_corrente + durata <= max_time_effettivo:
@@ -799,7 +830,7 @@ def finestre_mobili_con_somma_e_ritaglio(file_con_timestamp, durata_ore, data_co
     
     while corrente + durata <= max_time_effettivo:
         raster_sommato_path, finestra_info, file_inclusi = somma_file_tif_finestra(
-            file_con_timestamp, corrente, corrente + durata, temp_dir
+            file_con_timestamp, corrente, corrente + durata, temp_dir, radar_crs
         )
         
         if raster_sommato_path is not None:
@@ -835,8 +866,11 @@ def finestre_mobili_con_somma_e_ritaglio(file_con_timestamp, durata_ore, data_co
 
 
 def processa_zona_giorno(args):
-    """Funzione worker per il multiprocessing - processa una zona per un giorno specifico"""
-    zona_path, data_corrente, durate, shapefile_directory, statistiche_config, log_queue, integrity_report = args
+    """
+    Funzione worker per il multiprocessing - processa una zona per un giorno specifico
+    NOVITÀ: Gestisce riproiezione shapefile e passa radar_crs alle funzioni
+    """
+    zona_path, data_corrente, durate, shapefile_directory, statistiche_config, log_queue, integrity_report, radar_crs = args
     
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
@@ -846,7 +880,14 @@ def processa_zona_giorno(args):
             
             print(f"  [PID {os.getpid()}] Zona: {zona_nome}, Giorno: {data_corrente.strftime('%Y-%m-%d')}")
             
-            # Usa il report di integrità se disponibile
+            # NOVITÀ: Verifica e riproietta shapefile se necessario
+            if radar_crs is not None:
+                shapefile_path_finale, riproiettato, crs_orig = verifica_e_riproietta_shapefile(
+                    zona_path, radar_crs, temp_dir
+                )
+            else:
+                shapefile_path_finale = zona_path
+            
             raster_giorno = ottieni_lista_file_giorno(data_corrente, integrity_report)
             
             if not raster_giorno:
@@ -867,12 +908,15 @@ def processa_zona_giorno(args):
             for durata in durate:
                 try:
                     risultato, finestre_log = finestre_mobili_con_somma_e_ritaglio(
-                        file_con_timestamp, durata, data_corrente, zona_path, statistiche_config, temp_dir
+                        file_con_timestamp, durata, data_corrente, shapefile_path_finale, 
+                        statistiche_config, temp_dir, radar_crs
                     )
                     risultati[durata] = risultato
                     log_data[durata] = finestre_log
                 except Exception as e:
                     print(f"  [PID {os.getpid()}] ERRORE durata {durata}h per zona {zona_nome}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
                     risultati[durata] = None
                     log_data[durata] = []
             
@@ -889,6 +933,8 @@ def processa_zona_giorno(args):
         except Exception as e:
             zona_nome = os.path.basename(zona_path).split('.')[0]
             print(f"  [PID {os.getpid()}] ERRORE CRITICO zona {zona_nome} per {data_corrente.strftime('%Y-%m-%d')}: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return zona_nome, data_corrente, {durata: None for durata in durate}, {}
 
 
@@ -896,7 +942,7 @@ def main():
     """Funzione principale con supporto multiprocessing e logging"""
     
     if len(sys.argv) != 2:
-        print("Uso: python Analisi_file_radar.py config.json")
+        print("Uso: python Analisi_file_radar_fix_CRS.py config.json")
         sys.exit(1)
     
     config_path = sys.argv[1]
@@ -907,17 +953,33 @@ def main():
     log_manager = LogManager(log_dir)
     
     log_manager.log_info("=" * 100)
-    log_manager.log_info("INIZIO ANALISI RADAR PLUVIOMETRICA")
+    log_manager.log_info("INIZIO ANALISI RADAR PLUVIOMETRICA - VERSIONE CON FIX CRS")
     log_manager.log_info("=" * 100)
     log_manager.log_info("")
+    
+    # FASE 0: RILEVAMENTO CRS ARCHIVIO RADAR
+    log_manager.log_info("FASE 0: Rilevamento CRS archivio radar")
+    log_manager.log_info("-" * 100)
+    
+    radar_crs = rileva_crs_radar_da_archivio(config['data_inizio'])
+    
+    if radar_crs is None:
+        log_manager.log_error("ERRORE CRITICO: Impossibile rilevare CRS dall'archivio radar")
+        log_manager.log_error("L'analisi potrebbe fallire o dare risultati errati")
+        log_manager.log_info("")
+    else:
+        log_manager.log_info(f"CRS archivio radar rilevato: {radar_crs}")
+        if radar_crs.to_epsg():
+            log_manager.log_info(f"EPSG: {radar_crs.to_epsg()}")
+        else:
+            log_manager.log_info("CRS non standard (senza codice EPSG)")
+        log_manager.log_info("")
     
     # FASE 1: VERIFICA INTEGRITA' ARCHIVIO
     log_manager.log_info("FASE 1: Verifica integrità archivio file radar")
     log_manager.log_info("-" * 100)
     
     integrity_report = verifica_integrita_archivio(config['data_inizio'], config['data_fine'])
-    
-    # Scrivi il report di integrità nel log
     log_manager.log_integrity_report(integrity_report)
     
     # FASE 2: CONFIGURAZIONE ANALISI
@@ -937,8 +999,36 @@ def main():
     log_manager.log_info(f"Durate: {durate} ore")
     log_manager.log_info(f"Statistiche: {statistiche_attive}")
     log_manager.log_info(f"Calcolo Peq_0: {'SI' if config['statistiche'].get('Peq_0', False) else 'NO'}")
-    log_manager.log_info(f"Logica: SOMMA PRIMA, RITAGLIA DOPO (PARALLELA)")
+    log_manager.log_info(f"Logica: SOMMA PRIMA, RITAGLIA DOPO (PARALLELA) + AUTO CRS FIX")
     log_manager.log_info("")
+    
+    # FASE 2.5: VERIFICA CRS SHAPEFILE
+    log_manager.log_info("FASE 2.5: Verifica compatibilità CRS shapefile")
+    log_manager.log_info("-" * 100)
+    
+    with tempfile.TemporaryDirectory() as temp_crs_check:
+        for zona_path in zone_paths:
+            zona_nome = os.path.basename(zona_path)
+            try:
+                gdf = gpd.read_file(zona_path)
+                shapefile_crs = gdf.crs
+                log_manager.log_info(f"Shapefile: {zona_nome}")
+                log_manager.log_info(f"  CRS: {shapefile_crs}")
+                
+                if radar_crs is not None and shapefile_crs is not None:
+                    if shapefile_crs == radar_crs:
+                        log_manager.log_info(f"  ✓ CRS compatibile con radar, nessuna riproiezione necessaria")
+                    else:
+                        log_manager.log_warning(f"  ⚠ CRS diverso da radar - Verrà riproiettato automaticamente")
+                        log_manager.log_info(f"    Da: {shapefile_crs}")
+                        log_manager.log_info(f"    A: {radar_crs}")
+                elif shapefile_crs is None:
+                    log_manager.log_error(f"  ✗ Shapefile SENZA CRS definito - Potrebbe causare errori!")
+                
+                log_manager.log_info("")
+            except Exception as e:
+                log_manager.log_error(f"Errore nella verifica CRS per {zona_nome}: {e}")
+                log_manager.log_info("")
     
     # FASE 3: ELABORAZIONE DATI
     log_manager.log_info("=" * 100)
@@ -964,7 +1054,7 @@ def main():
     for data in date_range:
         for zona_path in zone_paths:
             task = (zona_path, data, durate, config['shapefile_directory'], 
-                   config['statistiche'], log_queue, integrity_report)
+                   config['statistiche'], log_queue, integrity_report, radar_crs)
             tasks.append(task)
     
     log_manager.log_info(f"Totale task da elaborare: {len(tasks)}")
@@ -980,7 +1070,7 @@ def main():
                 zona_nome, data_corrente, stats_zona, log_data = future.result()
                 completed_tasks += 1
                 
-                if completed_tasks % 50 == 0:
+                if completed_tasks % 50 == 0 or completed_tasks == len(tasks):
                     progress_msg = f"Completati {completed_tasks}/{len(tasks)} task ({completed_tasks/len(tasks)*100:.1f}%)"
                     print(progress_msg)
                     log_manager.log_info(progress_msg)
@@ -1035,9 +1125,23 @@ def main():
                 zone_ordinate = [z.split('.')[0] for z in zone_shapefiles]
                 df = df.reindex(columns=zone_ordinate)
                 df = df.sort_index()
-                # Reset index per avere 'Data' come colonna
                 df = df.reset_index()
                 dataframes_finali[chiave] = df
+                log_manager.log_info(f"  Foglio {chiave}: {len(df)} righe, {len(zone_ordinate)} zone")
+        
+        if not dataframes_finali:
+            log_manager.log_error("ERRORE: Nessun dato valido generato dall'analisi!")
+            log_manager.log_error("Possibili cause:")
+            log_manager.log_error("  1. Problema di compatibilità CRS tra raster e shapefile")
+            log_manager.log_error("  2. Shapefile fuori dall'area coperta dai raster")
+            log_manager.log_error("  3. File raster corrotti o mancanti")
+            log_manager.log_error("  4. Errori durante l'elaborazione")
+            log_manager.log_info("")
+            log_manager.log_info("Verifica:")
+            log_manager.log_info(f"  - CRS radar rilevato: {radar_crs}")
+            log_manager.log_info(f"  - Shapefile directory: {config['shapefile_directory']}")
+            log_manager.log_info(f"  - Numero zone: {len(zone_shapefiles)}")
+            sys.exit(1)
         
         os.makedirs(config['output_directory'], exist_ok=True)
         output_path = os.path.join(config['output_directory'], config['output_filename'])
@@ -1047,6 +1151,7 @@ def main():
                 df.to_excel(writer, sheet_name=chiave, index=False)
         
         log_manager.log_info(f"File Excel base generato: {output_path}")
+        log_manager.log_info(f"Fogli creati: {len(dataframes_finali)}")
         log_manager.log_info("")
         
         # FASE 5: CALCOLO PEQ_0 (SE RICHIESTO)
@@ -1056,62 +1161,53 @@ def main():
             log_manager.log_info("=" * 100)
             log_manager.log_info("")
             
-            # Verifica presenza durata 24h
             if 24 not in durate:
-                log_manager.log_warning("ATTENZIONE: Peq_0 richiesta ma durata 24h NON presente nella configurazione")
-                log_manager.log_warning("Per calcolare Peq_0 è necessario includere 24 nelle durate_ore")
+                log_manager.log_warning("ATTENZIONE: Peq_0 richiesta ma durata 24h NON presente")
                 log_manager.log_warning("Calcolo Peq_0 SALTATO")
                 log_manager.log_info("")
             else:
-                # Verifica presenza directory raster CN
                 raster_cn_dir = config.get('raster_cn_directory')
                 if not raster_cn_dir or not os.path.exists(raster_cn_dir):
-                    log_manager.log_error("Directory raster CN non trovata o non specificata")
-                    log_manager.log_error(f"  Path configurato: {raster_cn_dir}")
+                    log_manager.log_error("Directory raster CN non trovata")
+                    log_manager.log_error(f"  Path: {raster_cn_dir}")
                     log_manager.log_error("  Calcolo Peq_0 SALTATO")
                     log_manager.log_info("")
                 else:
                     log_manager.log_info(f"Directory raster CN: {raster_cn_dir}")
                     log_manager.log_info("")
                     
-                    # Calcola CN per ogni zona
                     log_manager.log_info("Calcolo Curve Number per zone...")
                     zone_cn = calcola_cn_per_zone(raster_cn_dir)
                     
                     if not zone_cn:
-                        log_manager.log_error("Nessun CN calcolato. Verificare i file raster")
+                        log_manager.log_error("Nessun CN calcolato")
                         log_manager.log_error("  Calcolo Peq_0 SALTATO")
                         log_manager.log_info("")
                     else:
                         log_manager.log_info(f"CN calcolati per {len(zone_cn)} zone")
                         log_manager.log_info("")
                         
-                        # Estrai il DataFrame media_24h
                         chiave_24h = 'media_24h'
                         if chiave_24h not in dataframes_finali:
-                            log_manager.log_error(f"Foglio {chiave_24h} non trovato nei risultati")
+                            log_manager.log_error(f"Foglio {chiave_24h} non trovato")
                             log_manager.log_error("  Calcolo Peq_0 SALTATO")
                             log_manager.log_info("")
                         else:
                             df_24h = dataframes_finali[chiave_24h].copy()
                             log_manager.log_info(f"Dati media_24h: {len(df_24h)} giorni")
                             
-                            # Calcola cumulata 5 giorni
                             log_manager.log_info("Calcolo cumulata 5 giorni precedenti...")
                             cum_5d = calcola_cum_5d(df_24h)
                             log_manager.log_info("Cumulata 5d calcolata")
                             
-                            # Calcola Peq_0
                             log_manager.log_info("Calcolo Peq_0 per tutte le zone...")
                             peq0_df = calcola_peq0_per_tutte_zone(cum_5d, zone_cn)
                             log_manager.log_info("Peq_0 calcolato")
                             log_manager.log_info("")
                             
-                            # Crea fogli con Peq_0
                             log_manager.log_info("Creazione fogli con Peq_0...")
                             fogli_peq0 = {}
                             
-                            # IMPORTANTE: Aggiungi sempre il foglio Peq0 base
                             fogli_peq0['Peq0'] = peq0_df
                             fogli_peq0['Cum_5d'] = cum_5d
                             
@@ -1128,11 +1224,9 @@ def main():
                             
                             log_manager.log_info("")
                             
-                            # Salva tutti i fogli aggiuntivi
                             log_manager.log_info("Salvataggio fogli aggiuntivi nel file Excel...")
                             
                             with pd.ExcelWriter(output_path, mode='a', if_sheet_exists='replace', engine='openpyxl') as writer:
-                                # Salva tutti i fogli Peq_0 (include Cum_5d e Peq0)
                                 for chiave, df in fogli_peq0.items():
                                     df.to_excel(writer, sheet_name=chiave, index=False)
                                     log_manager.log_info(f"  Salvato foglio: {chiave}")
@@ -1149,6 +1243,12 @@ def main():
         log_manager.log_info("=" * 100)
         log_manager.log_info(f"File Excel: {output_path}")
         log_manager.log_info(f"File Log: {log_manager.log_file}")
+        log_manager.log_info("")
+        log_manager.log_info("RIEPILOGO MIGLIORAMENTI CRS:")
+        log_manager.log_info("  ✓ Rilevamento automatico CRS archivio radar")
+        log_manager.log_info("  ✓ Riproiezione automatica shapefile quando necessario")
+        log_manager.log_info("  ✓ Logging dettagliato compatibilità sistemi di riferimento")
+        log_manager.log_info("=" * 100)
         
         print(f"\n=== ANALISI COMPLETATA ===")
         print(f"File Excel: {output_path}")
@@ -1158,6 +1258,8 @@ def main():
         error_msg = f"Errore nel salvataggio: {str(e)}"
         print(error_msg)
         log_manager.log_error(error_msg)
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
