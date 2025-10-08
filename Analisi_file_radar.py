@@ -48,11 +48,11 @@ LAMBDA_PEQ = 0.2
 # -------------------------------------------------------------------------
 def get_optimal_process_count():
     """
-    Calcola il numero ottimale di processi: (core_totali // 2) - 1
+    Calcola il numero ottimale di processi: (core_totali // 3) - 1
     Con minimo di 1 processo
     """
     total_cores = psutil.cpu_count(logical=True)
-    optimal_processes = max(1, (total_cores // 2) - 1)
+    optimal_processes = max(1, (total_cores // 3) - 1)
     
     print(f"Sistema rilevato con {total_cores} core logici")
     print(f"Utilizzo ottimale: {optimal_processes} processi paralleli")
@@ -1161,4 +1161,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
